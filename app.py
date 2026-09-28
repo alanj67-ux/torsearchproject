@@ -1,7 +1,10 @@
 import os
 import re
 import hmac
+import secrets
+import threading
 import ipaddress
+
 from urllib.parse import (
     quote,
     quote_plus,
@@ -14,41 +17,10 @@ from urllib.parse import (
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, request, Response
-from markupsafe import escape
+from flask import Flask, request, Response, redirect
 
 
 app = Flask(__name__)
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-TOR_PROXY = {
-    "http": "socks5h://127.0.0.1:9050",
-    "https": "socks5h://127.0.0.1:9050",
-}
-
-DEFAULT_ENGINE = "duckduckgo.com"
-
-ENDPOINTS = {
-    "google.com": "https://www.google.com/search?q={}&num=20",
-    "duckduckgo.com": "https://html.duckduckgo.com/html/?q={}",
-    "bing.com": "https://www.bing.com/search?q={}",
-    "startpage.com": "https://www.startpage.com/sp/search?query={}",
-    "search.brave.com": "https://search.brave.com/search?q={}",
-    "youtube.com": "https://www.youtube.com/results?search_query={}",
-}
-
-UA = (
-    "Mozilla/5.0 (X11; Linux x86_64) "
-    "AppleWebKit/537.36 "
-    "(KHTML, like Gecko) "
-    "Chrome/124.0 Safari/537.36"
-)
-
-MAX_RESPONSE_SIZE = 15 * 1024 * 1024
-MAX_REDIRECTS = 6
 
 
 # ============================================================
@@ -60,13 +32,14 @@ SITE_PASSWORD = os.environ.get("SITE_PASSWORD")
 
 
 @app.before_request
-def authenticate():
+def require_login():
+    # Allow Render/Docker health checks.
     if request.path == "/health":
         return None
 
     if not SITE_PASSWORD:
         return Response(
-            "SITE_PASSWORD environment variable has not been set.",
+            "SITE_PASSWORD has not been configured.",
             status=500,
             mimetype="text/plain",
         )
@@ -97,10 +70,121 @@ def login_required():
         "Login required",
         status=401,
         headers={
-            "WWW-Authenticate": 'Basic realm="Tor Search"'
+            "WWW-Authenticate": 'Basic realm="Tor Browser Proxy"'
         },
         mimetype="text/plain",
     )
+
+
+# ============================================================
+# TOR
+# ============================================================
+
+TOR_PROXY = {
+    "http": "socks5h://127.0.0.1:9050",
+    "https": "socks5h://127.0.0.1:9050",
+}
+
+
+# ============================================================
+# SEARCH ENGINES
+# ============================================================
+
+# DuckDuckGo sometimes rejects Tor exit nodes.
+# Use Brave as the default instead.
+DEFAULT_ENGINE = "search.brave.com"
+
+ENDPOINTS = {
+    "google.com":
+        "https://www.google.com/search?q={}&num=20",
+
+    "duckduckgo.com":
+        "https://html.duckduckgo.com/html/?q={}",
+
+    "bing.com":
+        "https://www.bing.com/search?q={}",
+
+    "startpage.com":
+        "https://www.startpage.com/sp/search?query={}",
+
+    "search.brave.com":
+        "https://search.brave.com/search?q={}",
+
+    "youtube.com":
+        "https://www.youtube.com/results?search_query={}",
+}
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 "
+    "(KHTML, like Gecko) "
+    "Chrome/124.0 Safari/537.36"
+)
+
+MAX_REWRITE_SIZE = 25 * 1024 * 1024
+MAX_REDIRECTS = 8
+
+
+BLOCKED_HOSTS = {
+    "localhost",
+    "localhost.localdomain",
+    "host.docker.internal",
+    "metadata.google.internal",
+}
+
+
+# ============================================================
+# REMOTE COOKIE SESSIONS
+# ============================================================
+
+REMOTE_SESSIONS = {}
+REMOTE_LOCK = threading.Lock()
+MAX_REMOTE_SESSIONS = 100
+
+
+def get_remote_session():
+    sid = request.cookies.get("proxy_sid")
+    created = False
+
+    with REMOTE_LOCK:
+        if not sid or sid not in REMOTE_SESSIONS:
+            sid = secrets.token_urlsafe(24)
+
+            session = requests.Session()
+
+            session.proxies.update(TOR_PROXY)
+
+            REMOTE_SESSIONS[sid] = session
+
+            created = True
+
+            if len(REMOTE_SESSIONS) > MAX_REMOTE_SESSIONS:
+                first = next(iter(REMOTE_SESSIONS))
+
+                if first != sid:
+                    REMOTE_SESSIONS.pop(first, None)
+
+        session = REMOTE_SESSIONS[sid]
+
+    return session, sid, created
+
+
+def attach_session_cookie(response, sid, created):
+    if created:
+        response.set_cookie(
+            "proxy_sid",
+            sid,
+            httponly=True,
+            samesite="Lax",
+            max_age=60 * 60 * 12,
+        )
+
+    return response
 
 
 # ============================================================
@@ -111,7 +195,9 @@ INDEX = """
 <!doctype html>
 
 <html>
+
 <head>
+
 <meta charset="utf-8">
 
 <meta
@@ -119,13 +205,20 @@ INDEX = """
     content="width=device-width, initial-scale=1"
 >
 
-<title>Tor Search</title>
+<title>Tor Browser Proxy</title>
 
 <style>
 
+* {
+    box-sizing: border-box;
+}
+
 body {
+    margin: 0;
+
     background: #0d1117;
     color: #e6edf3;
+
     font-family:
         ui-monospace,
         SFMono-Regular,
@@ -138,118 +231,135 @@ body {
     flex-direction: column;
     align-items: center;
 
-    padding: 14vh 20px 40px 20px;
+    padding: 14vh 20px 40px;
 }
 
 h1 {
     font-weight: 400;
-    letter-spacing: .05em;
     color: #7ee787;
-    margin-bottom: 30px;
+    letter-spacing: .04em;
 }
 
 form {
     display: flex;
-    gap: .5rem;
     width: 100%;
-    max-width: 700px;
+    max-width: 760px;
+    gap: 8px;
 }
 
 input {
+    flex: 1;
+
     background: #161b22;
+
     border: 1px solid #30363d;
+
     color: #e6edf3;
 
-    padding: .75rem 1rem;
-    font-size: 1rem;
+    padding: .8rem 1rem;
+
     border-radius: 6px;
 
-    font-family: inherit;
-    flex: 1;
+    font: inherit;
 }
 
 button {
     background: #238636;
-    color: #fff;
 
     border: 0;
-    padding: .75rem 1.3rem;
 
-    font-size: 1rem;
+    color: white;
+
+    padding: .8rem 1.3rem;
+
     border-radius: 6px;
 
+    font: inherit;
+
     cursor: pointer;
-    font-family: inherit;
 }
 
 button:hover {
     background: #2ea043;
 }
 
-.hint {
+.info {
     color: #8b949e;
 
-    font-size: .85rem;
     margin-top: 2rem;
 
-    max-width: 700px;
+    max-width: 760px;
+
     text-align: center;
-    line-height: 1.6;
+
+    line-height: 1.7;
+
+    font-size: .85rem;
 }
 
 .status {
-    margin-top: 25px;
-
     color: #7ee787;
+
+    margin-top: 1.5rem;
+
     font-size: .8rem;
 }
 
 </style>
+
 </head>
 
 <body>
 
-<h1>tor search</h1>
+<h1>tor browser proxy</h1>
 
-<form action="/search" method="get">
+<form action="/go" method="get">
 
 <input
     name="q"
-    placeholder="search · or youtube.com cats"
+    placeholder="search or enter a website"
     autocomplete="off"
     autofocus
 >
 
 <button type="submit">
-search
+go
 </button>
 
 </form>
 
-<p class="hint">
+<div class="info">
 
-Use normal text to search DuckDuckGo.
+Normal text searches Brave through Tor.
 
 <br><br>
 
-You can also begin with:
+Examples:
 
 <br>
 
-google.com ·
-duckduckgo.com ·
-bing.com ·
-startpage.com ·
-search.brave.com ·
-youtube.com
+minecraft servers
 
-</p>
+<br>
+
+youtube.com minecraft
+
+<br>
+
+google.com linux
+
+<br>
+
+https://example.com
+
+</div>
 
 <div class="status">
-requests routed through Tor
+server traffic → Tor
 </div>
 
 </body>
+
 </html>
 """
 
@@ -271,16 +381,8 @@ def health():
 
 
 # ============================================================
-# SECURITY
+# SECURITY CHECK
 # ============================================================
-
-BLOCKED_HOSTS = {
-    "localhost",
-    "localhost.localdomain",
-    "metadata.google.internal",
-    "host.docker.internal",
-}
-
 
 def safe_target(url):
     try:
@@ -325,137 +427,15 @@ def safe_target(url):
 
 
 # ============================================================
-# TOR FETCH
-# ============================================================
-
-def fetch(url, method="GET", data=None):
-    current_url = url
-
-    for _ in range(MAX_REDIRECTS + 1):
-
-        if not safe_target(current_url):
-            raise requests.RequestException(
-                "blocked destination"
-            )
-
-        r = requests.request(
-            method,
-            current_url,
-
-            data=data,
-
-            proxies=TOR_PROXY,
-
-            headers={
-                "User-Agent": UA,
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept": "*/*",
-            },
-
-            timeout=(10, 40),
-            allow_redirects=False,
-            stream=True,
-        )
-
-        if r.status_code in (
-            301,
-            302,
-            303,
-            307,
-            308,
-        ):
-            location = r.headers.get("Location")
-
-            if not location:
-                break
-
-            next_url = urljoin(
-                current_url,
-                location,
-            )
-
-            status_code = r.status_code
-            r.close()
-
-            current_url = next_url
-
-            if status_code in (
-                301,
-                302,
-                303,
-            ):
-                method = "GET"
-                data = None
-
-            continue
-
-        length = r.headers.get(
-            "Content-Length"
-        )
-
-        if length:
-            try:
-                if int(length) > MAX_RESPONSE_SIZE:
-                    r.close()
-
-                    raise requests.RequestException(
-                        "response too large"
-                    )
-
-            except ValueError:
-                pass
-
-        content = bytearray()
-
-        for chunk in r.iter_content(
-            chunk_size=65536
-        ):
-            if not chunk:
-                continue
-
-            content.extend(chunk)
-
-            if len(content) > MAX_RESPONSE_SIZE:
-                r.close()
-
-                raise requests.RequestException(
-                    "response too large"
-                )
-
-        r._content = bytes(content)
-        r.close()
-
-        return r
-
-    raise requests.RequestException(
-        "too many redirects"
-    )
-
-
-# ============================================================
-# PROXY URL
+# CREATE A LOCAL /proxy URL
 # ============================================================
 
 def proxy_url(target):
-    if not target:
-        return "#"
-
-    target = target.strip()
-
-    if target.startswith("#"):
-        return target
-
     parsed = urlsplit(target)
-
-    if parsed.scheme not in (
-        "http",
-        "https",
-    ):
-        return "#"
 
     fragment = parsed.fragment
 
-    clean_target = urlunsplit(
+    clean = urlunsplit(
         (
             parsed.scheme,
             parsed.netloc,
@@ -465,12 +445,9 @@ def proxy_url(target):
         )
     )
 
-    result = (
-        "/proxy?url="
-        + quote(
-            clean_target,
-            safe="",
-        )
+    result = "/proxy?url=" + quote(
+        clean,
+        safe="",
     )
 
     if fragment:
@@ -483,95 +460,725 @@ def proxy_url(target):
 
 
 # ============================================================
-# CSS REWRITE
+# ADD FORM QUERY PARAMETERS TO REMOTE URL
 # ============================================================
 
-CSS_URL_RE = re.compile(
+def merge_query_parameters(target):
+    extra = []
+
+    for key in request.args:
+        if key == "url":
+            continue
+
+        for value in request.args.getlist(key):
+            extra.append((key, value))
+
+    if not extra:
+        return target
+
+    parsed = urlsplit(target)
+
+    existing = parse_qsl(
+        parsed.query,
+        keep_blank_values=True,
+    )
+
+    query = urlencode(
+        existing + extra,
+        doseq=True,
+    )
+
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            query,
+            parsed.fragment,
+        )
+    )
+
+
+# ============================================================
+# HEADERS SENT TO DESTINATION
+# ============================================================
+
+def destination_headers():
+    headers = {
+        "User-Agent": USER_AGENT,
+
+        "Accept":
+            request.headers.get(
+                "Accept",
+                "*/*",
+            ),
+
+        "Accept-Language":
+            request.headers.get(
+                "Accept-Language",
+                "en-US,en;q=0.9",
+            ),
+
+        "Accept-Encoding": "identity",
+    }
+
+    for name in (
+        "Content-Type",
+        "Range",
+        "If-Range",
+        "If-None-Match",
+        "If-Modified-Since",
+    ):
+        value = request.headers.get(name)
+
+        if value:
+            headers[name] = value
+
+    return headers
+
+
+# ============================================================
+# FETCH THROUGH TOR
+# ============================================================
+
+def fetch_through_tor(
+    session,
+    target,
+    method="GET",
+    body=None,
+):
+    current = target
+
+    current_method = method
+    current_body = body
+
+    for _ in range(MAX_REDIRECTS + 1):
+        if not safe_target(current):
+            raise requests.RequestException(
+                "blocked destination"
+            )
+
+        response = session.request(
+            current_method,
+            current,
+
+            data=current_body,
+
+            headers=destination_headers(),
+
+            timeout=(12, 60),
+
+            allow_redirects=False,
+
+            stream=True,
+        )
+
+        if response.status_code in (
+            301,
+            302,
+            303,
+            307,
+            308,
+        ):
+            location = response.headers.get(
+                "Location"
+            )
+
+            status = response.status_code
+
+            response.close()
+
+            if not location:
+                raise requests.RequestException(
+                    "redirect without Location"
+                )
+
+            current = urljoin(
+                current,
+                location,
+            )
+
+            if (
+                status in (301, 302, 303)
+                and current_method not in ("GET", "HEAD")
+            ):
+                current_method = "GET"
+                current_body = None
+
+            continue
+
+        response.final_url = current
+
+        return response
+
+    raise requests.RequestException(
+        "too many redirects"
+    )
+
+
+# ============================================================
+# CSS URL REWRITING
+# ============================================================
+
+CSS_URL = re.compile(
     r"url\(\s*(['\"]?)(.*?)\1\s*\)",
+    re.IGNORECASE,
+)
+
+CSS_IMPORT = re.compile(
+    r"@import\s+(['\"])(.*?)\1",
     re.IGNORECASE,
 )
 
 
 def rewrite_css(css, base_url):
+    def replace_url(match):
+        value = match.group(2).strip()
 
-    def replace(match):
-        target = match.group(2).strip()
-
-        if not target:
-            return match.group(0)
-
-        if target.startswith(
+        if value.startswith(
             (
                 "data:",
-                "#",
                 "blob:",
+                "#",
             )
         ):
             return match.group(0)
 
         absolute = urljoin(
             base_url,
-            target,
+            value,
         )
 
-        proxied = proxy_url(
-            absolute
+        if not safe_target(absolute):
+            return "url('')"
+
+        return (
+            "url('"
+            + proxy_url(absolute)
+            + "')"
         )
 
-        return f"url('{proxied}')"
+    def replace_import(match):
+        value = match.group(2).strip()
 
-    return CSS_URL_RE.sub(
-        replace,
+        absolute = urljoin(
+            base_url,
+            value,
+        )
+
+        if not safe_target(absolute):
+            return "@import ''"
+
+        return (
+            "@import '"
+            + proxy_url(absolute)
+            + "'"
+        )
+
+    css = CSS_URL.sub(
+        replace_url,
         css,
     )
 
+    css = CSS_IMPORT.sub(
+        replace_import,
+        css,
+    )
+
+    return css
+
 
 # ============================================================
-# HTML REWRITE
+# NORMAL URL ATTRIBUTE REWRITING
+# ============================================================
+
+def rewrite_url(value, base_url):
+    if not value:
+        return value
+
+    value = value.strip()
+
+    if value.startswith(
+        (
+            "#",
+            "data:",
+            "blob:",
+            "javascript:",
+            "mailto:",
+            "tel:",
+        )
+    ):
+        return value
+
+    absolute = urljoin(
+        base_url,
+        value,
+    )
+
+    if not safe_target(absolute):
+        return "#"
+
+    return proxy_url(absolute)
+
+
+def rewrite_srcset(value, base_url):
+    output = []
+
+    for entry in value.split(","):
+        entry = entry.strip()
+
+        if not entry:
+            continue
+
+        pieces = entry.split()
+
+        source = pieces[0]
+
+        descriptor = " ".join(
+            pieces[1:]
+        )
+
+        if source.startswith(
+            (
+                "data:",
+                "blob:",
+            )
+        ):
+            new_source = source
+
+        else:
+            absolute = urljoin(
+                base_url,
+                source,
+            )
+
+            if not safe_target(absolute):
+                continue
+
+            new_source = proxy_url(
+                absolute
+            )
+
+        if descriptor:
+            output.append(
+                new_source
+                + " "
+                + descriptor
+            )
+        else:
+            output.append(
+                new_source
+            )
+
+    return ", ".join(output)
+
+
+# ============================================================
+# JAVASCRIPT NETWORK HOOK
+#
+# Helps redirect dynamically generated requests back through
+# /proxy rather than directly to the remote website.
+# ============================================================
+
+def javascript_hook(base_url):
+    escaped_base = (
+        base_url
+        .replace("\\", "\\\\")
+        .replace("'", "\\'")
+    )
+
+    return f"""
+<script>
+(() => {{
+
+const remoteBase = '{escaped_base}';
+
+
+function torURL(value) {{
+
+    if (
+        value === null
+        ||
+        value === undefined
+    ) {{
+        return value;
+    }}
+
+    let text = String(value);
+
+
+    if (
+        text.startsWith('#')
+        ||
+        text.startsWith('data:')
+        ||
+        text.startsWith('blob:')
+        ||
+        text.startsWith('javascript:')
+        ||
+        text.startsWith('mailto:')
+        ||
+        text.startsWith('tel:')
+    ) {{
+        return text;
+    }}
+
+
+    if (
+        text.startsWith('/proxy?')
+        ||
+        text.startsWith('/go?')
+    ) {{
+        return text;
+    }}
+
+
+    try {{
+
+        let absolute =
+            new URL(
+                text,
+                remoteBase
+            ).href;
+
+
+        if (
+            !absolute.startsWith('http://')
+            &&
+            !absolute.startsWith('https://')
+        ) {{
+            return text;
+        }}
+
+
+        return (
+            '/proxy?url='
+            +
+            encodeURIComponent(
+                absolute
+            )
+        );
+
+    }}
+
+    catch (_) {{
+        return text;
+    }}
+}}
+
+
+/*
+ * fetch()
+ */
+
+const nativeFetch =
+    window.fetch;
+
+
+if (nativeFetch) {{
+
+    window.fetch =
+        function(resource, options) {{
+
+            if (
+                resource
+                instanceof Request
+            ) {{
+
+                resource =
+                    new Request(
+
+                        torURL(
+                            resource.url
+                        ),
+
+                        resource
+                    );
+
+            }}
+
+            else {{
+
+                resource =
+                    torURL(
+                        resource
+                    );
+            }}
+
+
+            return nativeFetch.call(
+                this,
+                resource,
+                options
+            );
+        };
+}}
+
+
+/*
+ * XMLHttpRequest
+ */
+
+const nativeOpen =
+    XMLHttpRequest.prototype.open;
+
+
+XMLHttpRequest.prototype.open =
+    function(
+        method,
+        url,
+        ...args
+    ) {{
+
+        return nativeOpen.call(
+            this,
+            method,
+            torURL(url),
+            ...args
+        );
+    };
+
+
+/*
+ * Prevent new tabs.
+ */
+
+window.open =
+    function(url) {{
+
+        if (url) {{
+            window.location.href =
+                torURL(url);
+        }}
+
+        return window;
+    };
+
+
+/*
+ * Same-tab navigation.
+ */
+
+document.addEventListener(
+
+    'click',
+
+    function(event) {{
+
+        const link =
+            event.target.closest
+            ?
+            event.target.closest(
+                'a[href]'
+            )
+            :
+            null;
+
+
+        if (!link) {{
+            return;
+        }}
+
+
+        const href =
+            link.getAttribute(
+                'href'
+            );
+
+
+        if (
+            !href
+            ||
+            href.startsWith('#')
+            ||
+            href.startsWith(
+                'javascript:'
+            )
+        ) {{
+            return;
+        }}
+
+
+        event.preventDefault();
+
+
+        window.location.href =
+            torURL(href);
+
+    }},
+
+    true
+);
+
+
+/*
+ * Rewrite elements created dynamically.
+ */
+
+function fixElement(element) {{
+
+    if (
+        !element
+        ||
+        !element.getAttribute
+    ) {{
+        return;
+    }}
+
+
+    for (
+        const attribute
+        of
+        [
+            'href',
+            'src',
+            'poster',
+            'data-src'
+        ]
+    ) {{
+
+        let value =
+            element.getAttribute(
+                attribute
+            );
+
+
+        if (value) {{
+
+            element.setAttribute(
+
+                attribute,
+
+                torURL(value)
+            );
+        }}
+    }}
+
+
+    element.removeAttribute(
+        'target'
+    );
+}
+
+
+const observer =
+    new MutationObserver(
+
+        function(changes) {{
+
+            for (
+                const change
+                of changes
+            ) {{
+
+                if (
+                    change.type
+                    ===
+                    'attributes'
+                ) {{
+
+                    fixElement(
+                        change.target
+                    );
+                }}
+
+
+                for (
+                    const node
+                    of
+                    change.addedNodes
+                ) {{
+
+                    if (
+                        node.nodeType
+                        !== 1
+                    ) {{
+                        continue;
+                    }}
+
+
+                    fixElement(node);
+
+
+                    if (
+                        node.querySelectorAll
+                    ) {{
+
+                        node.querySelectorAll(
+                            '[href],'
+                            +
+                            '[src],'
+                            +
+                            '[poster],'
+                            +
+                            '[data-src]'
+                        )
+                        .forEach(
+                            fixElement
+                        );
+                    }}
+                }}
+            }}
+        }}
+    );
+
+
+observer.observe(
+
+    document.documentElement,
+
+    {{
+        childList: true,
+        subtree: true,
+
+        attributes: true,
+
+        attributeFilter: [
+            'href',
+            'src',
+            'poster',
+            'data-src',
+            'target'
+        ]
+    }}
+);
+
+}})();
+</script>
+"""
+
+
+# ============================================================
+# HTML REWRITING
 # ============================================================
 
 def rewrite_html(html, base_url):
-
     soup = BeautifulSoup(
         html,
         "html.parser",
     )
 
+    # Remove <base>, because it could bypass our rewritten URLs.
     for tag in soup.find_all("base"):
         tag.decompose()
 
-    # Remove JavaScript so pages cannot make direct browser-side
-    # network requests outside the proxy.
-    for script in soup.find_all("script"):
-        script.decompose()
-
-    for obj in soup.find_all(
-        [
-            "object",
-            "embed",
-        ]
-    ):
-        obj.decompose()
-
+    # Remove remote CSP/meta refresh.
     for meta in soup.find_all("meta"):
-        value = meta.get(
-            "http-equiv",
-            "",
-        ).lower()
+        value = (
+            meta.get(
+                "http-equiv",
+                "",
+            ).lower()
+        )
 
-        if value == "refresh":
+        if value in (
+            "content-security-policy",
+            "refresh",
+        ):
             meta.decompose()
 
+    # General attributes.
     for tag in soup.find_all(True):
-
-        for attribute in list(
-            tag.attrs.keys()
-        ):
-            if attribute.lower().startswith(
-                "on"
-            ):
-                del tag.attrs[attribute]
-
         tag.attrs.pop(
             "integrity",
             None,
@@ -582,14 +1189,25 @@ def rewrite_html(html, base_url):
             None,
         )
 
+        tag.attrs.pop(
+            "nonce",
+            None,
+        )
+
+        # No new tabs.
+        tag.attrs.pop(
+            "target",
+            None,
+        )
+
         if "style" in tag.attrs:
             tag["style"] = rewrite_css(
                 tag["style"],
                 base_url,
             )
 
+    # <style>
     for style in soup.find_all("style"):
-
         if style.string:
             style.string.replace_with(
                 rewrite_css(
@@ -598,153 +1216,118 @@ def rewrite_html(html, base_url):
                 )
             )
 
-    resource_attributes = {
+    attributes = {
         "a": "href",
         "area": "href",
+        "link": "href",
+        "script": "src",
         "img": "src",
         "iframe": "src",
         "source": "src",
         "video": "src",
         "audio": "src",
         "track": "src",
-        "link": "href",
     }
 
-    for tag_name, attribute in resource_attributes.items():
-
+    for tag_name, attribute in attributes.items():
         for tag in soup.find_all(
             tag_name
         ):
-
             value = tag.get(
                 attribute
             )
 
-            if not value:
-                continue
-
-            value = value.strip()
-
-            if value.startswith(
-                (
-                    "#",
-                    "data:",
-                    "blob:",
+            if value:
+                tag[attribute] = rewrite_url(
+                    value,
+                    base_url,
                 )
-            ):
-                continue
 
-            absolute = urljoin(
-                base_url,
-                value,
-            )
-
-            tag[attribute] = proxy_url(
-                absolute
-            )
-
+    # Responsive images.
     for tag in soup.find_all(
-        "video"
+        ["img", "source"]
     ):
-        poster = tag.get(
+        value = tag.get("srcset")
+
+        if value:
+            tag["srcset"] = rewrite_srcset(
+                value,
+                base_url,
+            )
+
+    # Video posters.
+    for video in soup.find_all("video"):
+        poster = video.get(
             "poster"
         )
 
         if poster:
-
-            absolute = urljoin(
-                base_url,
+            video["poster"] = rewrite_url(
                 poster,
+                base_url,
             )
 
-            tag["poster"] = proxy_url(
-                absolute
-            )
-
-    for tag in soup.find_all(
-        [
-            "img",
-            "source",
-        ]
-    ):
-        tag.attrs.pop(
-            "srcset",
-            None,
+    # Common lazy-loaded content.
+    for tag in soup.find_all(True):
+        value = tag.get(
+            "data-src"
         )
 
-    for form in soup.find_all(
-        "form"
-    ):
+        if value:
+            tag["data-src"] = rewrite_url(
+                value,
+                base_url,
+            )
 
-        original_action = (
+    # Forms.
+    for form in soup.find_all("form"):
+        action = (
             form.get("action")
             or base_url
         )
 
-        absolute_action = urljoin(
+        action = urljoin(
             base_url,
-            original_action,
+            action,
         )
 
-        method = form.get(
-            "method",
-            "get",
-        ).lower()
-
-        if method not in (
-            "get",
-            "post",
-        ):
-            method = "get"
-
-        form["action"] = "/form"
-        form["method"] = method
-
-        hidden = soup.new_tag(
-            "input"
+        method = (
+            form.get(
+                "method",
+                "get",
+            ).lower()
         )
 
-        hidden["type"] = "hidden"
-        hidden["name"] = "_target"
-        hidden["value"] = absolute_action
-
-        form.insert(
-            0,
-            hidden,
+        form.attrs.pop(
+            "target",
+            None,
         )
 
-    csp = soup.new_tag("meta")
+        if method == "get":
+            form["action"] = "/proxy"
 
-    csp["http-equiv"] = (
-        "Content-Security-Policy"
-    )
+            hidden = soup.new_tag(
+                "input"
+            )
 
-    csp["content"] = (
-        "default-src 'self' data: blob:; "
-        "img-src 'self' data: blob:; "
-        "style-src 'self' 'unsafe-inline'; "
-        "font-src 'self' data:; "
-        "script-src 'none'; "
-        "connect-src 'self'; "
-        "frame-src 'self'; "
-        "media-src 'self' data: blob:; "
-        "object-src 'none'; "
-        "base-uri 'none'; "
-        "form-action 'self';"
-    )
+            hidden["type"] = "hidden"
+            hidden["name"] = "url"
+            hidden["value"] = action
 
-    if soup.head:
-        soup.head.insert(
-            0,
-            csp,
-        )
-    else:
+            form.insert(
+                0,
+                hidden,
+            )
+
+        else:
+            form["action"] = proxy_url(
+                action
+            )
+
+    # Ensure head exists.
+    if soup.head is None:
         head = soup.new_tag(
             "head"
-        )
-
-        head.append(
-            csp
         )
 
         if soup.html:
@@ -758,455 +1341,394 @@ def rewrite_html(html, base_url):
                 head,
             )
 
+    head = soup.head
+
+    # Prevent direct network connections from page content.
+    csp = soup.new_tag(
+        "meta"
+    )
+
+    csp["http-equiv"] = (
+        "Content-Security-Policy"
+    )
+
+    csp["content"] = (
+        "default-src 'self' data: blob:; "
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob:; "
+        "font-src 'self' data:; "
+        "media-src 'self' data: blob:; "
+        "connect-src 'self'; "
+        "frame-src 'self'; "
+        "worker-src 'self' blob:; "
+        "object-src 'none'; "
+        "base-uri 'none'; "
+        "form-action 'self';"
+    )
+
+    head.insert(
+        0,
+        csp,
+    )
+
+    # Inject hook before most remote JavaScript runs.
+    helper = BeautifulSoup(
+        javascript_hook(
+            base_url
+        ),
+        "html.parser",
+    )
+
+    if helper.script:
+        head.insert(
+            1,
+            helper.script,
+        )
+
     return str(soup)
 
 
 # ============================================================
-# SEARCH
+# BUFFER TEXT RESPONSES
 # ============================================================
 
-def split_search(query):
+def read_remote_response(remote):
+    data = bytearray()
+
+    for chunk in remote.iter_content(
+        chunk_size=65536
+    ):
+        if not chunk:
+            continue
+
+        data.extend(chunk)
+
+        if len(data) > MAX_REWRITE_SIZE:
+            remote.close()
+
+            raise requests.RequestException(
+                "page too large to rewrite"
+            )
+
+    remote.close()
+
+    return bytes(data)
+
+
+# ============================================================
+# RETURN REMOTE FILES / VIDEO / IMAGES
+# ============================================================
+
+def stream_remote(
+    remote,
+    sid,
+    created,
+):
+    def generate():
+        try:
+            for chunk in remote.iter_content(
+                chunk_size=65536
+            ):
+                if chunk:
+                    yield chunk
+        finally:
+            remote.close()
+
+    headers = {}
+
+    for name in (
+        "Content-Type",
+        "Content-Length",
+        "Content-Range",
+        "Accept-Ranges",
+        "Cache-Control",
+        "ETag",
+        "Last-Modified",
+    ):
+        value = remote.headers.get(name)
+
+        if value:
+            headers[name] = value
+
+    headers[
+        "X-Content-Type-Options"
+    ] = "nosniff"
+
+    result = Response(
+        generate(),
+        status=remote.status_code,
+        headers=headers,
+        direct_passthrough=True,
+    )
+
+    return attach_session_cookie(
+        result,
+        sid,
+        created,
+    )
+
+
+# ============================================================
+# MAIN PROXY
+# ============================================================
+
+@app.route(
+    "/proxy",
+    methods=[
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "HEAD",
+    ],
+)
+def proxy():
+    target = request.args.get(
+        "url",
+        "",
+    ).strip()
+
+    if not target:
+        return Response(
+            "missing URL",
+            status=400,
+            mimetype="text/plain",
+        )
+
+    if request.method == "GET":
+        target = merge_query_parameters(
+            target
+        )
+
+    if not safe_target(target):
+        return Response(
+            "bad or blocked URL",
+            status=400,
+            mimetype="text/plain",
+        )
+
+    remote_session, sid, created = (
+        get_remote_session()
+    )
+
+    body = None
+
+    if request.method not in (
+        "GET",
+        "HEAD",
+    ):
+        body = request.get_data()
+
+    try:
+        remote = fetch_through_tor(
+            remote_session,
+            target,
+            request.method,
+            body,
+        )
+
+    except requests.RequestException as error:
+        result = Response(
+            "Tor request failed:\n\n"
+            + str(error),
+            status=502,
+            mimetype="text/plain",
+        )
+
+        return attach_session_cookie(
+            result,
+            sid,
+            created,
+        )
+
+    content_type = (
+        remote.headers.get(
+            "Content-Type",
+            "",
+        ).lower()
+    )
+
+    # HTML
+    if (
+        "text/html" in content_type
+        or
+        "application/xhtml+xml"
+        in content_type
+    ):
+        try:
+            raw = read_remote_response(
+                remote
+            )
+
+        except requests.RequestException as error:
+            return Response(
+                str(error),
+                status=502,
+            )
+
+        encoding = (
+            remote.encoding
+            or "utf-8"
+        )
+
+        text = raw.decode(
+            encoding,
+            errors="replace",
+        )
+
+        text = rewrite_html(
+            text,
+            remote.final_url,
+        )
+
+        result = Response(
+            text,
+            status=remote.status_code,
+            content_type=(
+                "text/html; charset=utf-8"
+            ),
+        )
+
+        result.headers[
+            "Referrer-Policy"
+        ] = "no-referrer"
+
+        return attach_session_cookie(
+            result,
+            sid,
+            created,
+        )
+
+    # CSS
+    if "text/css" in content_type:
+        raw = read_remote_response(
+            remote
+        )
+
+        text = raw.decode(
+            remote.encoding or "utf-8",
+            errors="replace",
+        )
+
+        text = rewrite_css(
+            text,
+            remote.final_url,
+        )
+
+        result = Response(
+            text,
+            status=remote.status_code,
+            content_type=(
+                "text/css; charset=utf-8"
+            ),
+        )
+
+        return attach_session_cookie(
+            result,
+            sid,
+            created,
+        )
+
+    # Other resources are streamed.
+    return stream_remote(
+        remote,
+        sid,
+        created,
+    )
+
+
+# ============================================================
+# TURN USER INPUT INTO A DESTINATION
+# ============================================================
+
+def input_to_target(text):
+    text = text.strip()
+
+    if text.startswith(
+        (
+            "http://",
+            "https://",
+        )
+    ):
+        return text
 
     first, separator, rest = (
-        query.partition(" ")
+        text.partition(" ")
     )
 
     if separator and rest:
-
         candidate = (
             first.lower()
-            .replace("https://", "")
-            .replace("http://", "")
+            .replace(
+                "https://",
+                "",
+            )
+            .replace(
+                "http://",
+                "",
+            )
             .split("/")[0]
         )
 
         if candidate in ENDPOINTS:
             return (
-                candidate,
-                rest.strip(),
+                ENDPOINTS[
+                    candidate
+                ]
+                .format(
+                    quote_plus(
+                        rest.strip()
+                    )
+                )
             )
 
+    # If it's just a domain, browse to it.
+    if " " not in text:
+        hostname = text.split("/")[0]
+
+        if "." in hostname:
+            return (
+                "https://"
+                + text
+            )
+
+    # Otherwise perform default Brave search.
     return (
-        DEFAULT_ENGINE,
-        query,
+        ENDPOINTS[
+            DEFAULT_ENGINE
+        ]
+        .format(
+            quote_plus(text)
+        )
     )
 
 
-@app.route("/search")
-def search():
+# ============================================================
+# SEARCH / URL BAR
+# ============================================================
 
+@app.route("/go")
+def go():
     q = request.args.get(
         "q",
         "",
     ).strip()
 
     if not q:
+        return redirect("/")
+
+    target = input_to_target(q)
+
+    if not safe_target(target):
         return Response(
-            "<pre>empty query</pre>",
+            "bad or blocked URL",
             status=400,
-            mimetype="text/html",
         )
 
-    domain, query = split_search(q)
-
-    template = ENDPOINTS[
-        domain
-    ]
-
-    target = template.format(
-        quote_plus(query)
-    )
-
-    try:
-        r = fetch(
-            target
-        )
-
-    except requests.RequestException as e:
-
-        return Response(
-            (
-                "<pre>"
-                "Tor fetch failed:\n\n"
-                f"{escape(str(e))}\n\n"
-                "Is Tor running on "
-                "127.0.0.1:9050?"
-                "</pre>"
-            ),
-            status=502,
-            mimetype="text/html",
-        )
-
-    content_type = (
-        r.headers.get(
-            "Content-Type",
-            ""
-        )
-    )
-
-    if "html" not in content_type.lower():
-
-        return Response(
-            r.content,
-            status=r.status_code,
-            content_type=content_type,
-        )
-
-    text = r.content.decode(
-        r.encoding or "utf-8",
-        errors="replace",
-    )
-
-    rewritten = rewrite_html(
-        text,
-        r.url,
-    )
-
-    soup = BeautifulSoup(
-        rewritten,
-        "html.parser",
-    )
-
-    banner = BeautifulSoup(
-        f"""
-        <div style="
-            background:#0d1117;
-            color:#e6edf3;
-            border-bottom:1px solid #30363d;
-            padding:12px;
-            font-family:monospace;
-            position:relative;
-            z-index:999999;
-        ">
-
-        <form
-            action="/search"
-            method="get"
-            style="
-                display:flex;
-                gap:8px;
-                margin:0 0 8px 0;
-            "
-        >
-
-        <input
-            name="q"
-            value="{escape(q)}"
-            autocomplete="off"
-            style="
-                flex:1;
-                padding:8px;
-            "
-        >
-
-        <button
-            type="submit"
-            style="
-                padding:8px 14px;
-            "
-        >
-        search
-        </button>
-
-        </form>
-
-        <span
-            style="
-                color:#7ee787;
-                font-size:12px;
-            "
-        >
-        Tor → {escape(domain)}
-        </span>
-
-        &nbsp;
-
-        <a
-            href="/"
-            style="
-                color:#79c0ff;
-                font-size:12px;
-            "
-        >
-        home
-        </a>
-
-        </div>
-        """,
-        "html.parser",
-    )
-
-    if soup.body:
-        soup.body.insert(
-            0,
-            banner,
-        )
-
-    return Response(
-        str(soup),
-        status=r.status_code,
-        content_type="text/html; charset=utf-8",
-    )
-
-
-# ============================================================
-# PAGE / RESOURCE PROXY
-# ============================================================
-
-@app.route("/proxy")
-def proxy():
-
-    target = request.args.get(
-        "url",
-        "",
-    ).strip()
-
-    if not safe_target(
-        target
-    ):
-        return Response(
-            "<pre>bad or blocked URL</pre>",
-            status=400,
-            mimetype="text/html",
-        )
-
-    try:
-        r = fetch(
-            target
-        )
-
-    except requests.RequestException as e:
-
-        return Response(
-            (
-                "<pre>"
-                "Proxy fetch failed:\n\n"
-                f"{escape(str(e))}"
-                "</pre>"
-            ),
-            status=502,
-            mimetype="text/html",
-        )
-
-    content_type = (
-        r.headers.get(
-            "Content-Type",
-            "application/octet-stream",
-        )
-    )
-
-    lower_type = (
-        content_type.lower()
-    )
-
-    if (
-        "text/html" in lower_type
-        or "application/xhtml+xml" in lower_type
-    ):
-
-        text = r.content.decode(
-            r.encoding or "utf-8",
-            errors="replace",
-        )
-
-        text = rewrite_html(
-            text,
-            r.url,
-        )
-
-        response = Response(
-            text,
-            status=r.status_code,
-            content_type=(
-                "text/html; charset=utf-8"
-            ),
-        )
-
-    elif "text/css" in lower_type:
-
-        text = r.content.decode(
-            r.encoding or "utf-8",
-            errors="replace",
-        )
-
-        text = rewrite_css(
-            text,
-            r.url,
-        )
-
-        response = Response(
-            text,
-            status=r.status_code,
-            content_type=(
-                "text/css; charset=utf-8"
-            ),
-        )
-
-    else:
-
-        response = Response(
-            r.content,
-            status=r.status_code,
-            content_type=content_type,
-        )
-
-    response.headers[
-        "X-Content-Type-Options"
-    ] = "nosniff"
-
-    response.headers[
-        "Referrer-Policy"
-    ] = "no-referrer"
-
-    return response
-
-
-# ============================================================
-# PROXIED FORMS
-# ============================================================
-
-@app.route(
-    "/form",
-    methods=[
-        "GET",
-        "POST",
-    ],
-)
-def proxy_form():
-
-    target = (
-        request.values.get(
-            "_target",
-            "",
-        ).strip()
-    )
-
-    if not safe_target(
-        target
-    ):
-        return Response(
-            "<pre>bad or blocked form destination</pre>",
-            status=400,
-            mimetype="text/html",
-        )
-
-    if request.method == "GET":
-
-        values = []
-
-        for key in request.args:
-
-            if key == "_target":
-                continue
-
-            for value in request.args.getlist(
-                key
-            ):
-                values.append(
-                    (
-                        key,
-                        value,
-                    )
-                )
-
-        parsed = urlsplit(
-            target
-        )
-
-        existing = parse_qsl(
-            parsed.query,
-            keep_blank_values=True,
-        )
-
-        new_query = urlencode(
-            existing + values,
-            doseq=True,
-        )
-
-        target = urlunsplit(
-            (
-                parsed.scheme,
-                parsed.netloc,
-                parsed.path,
-                new_query,
-                "",
-            )
-        )
-
-        method = "GET"
-        data = None
-
-    else:
-
-        method = "POST"
-        data = []
-
-        for key in request.form:
-
-            if key == "_target":
-                continue
-
-            for value in request.form.getlist(
-                key
-            ):
-                data.append(
-                    (
-                        key,
-                        value,
-                    )
-                )
-
-    try:
-        r = fetch(
-            target,
-            method=method,
-            data=data,
-        )
-
-    except requests.RequestException as e:
-
-        return Response(
-            (
-                "<pre>"
-                "Form request failed:\n\n"
-                f"{escape(str(e))}"
-                "</pre>"
-            ),
-            status=502,
-            mimetype="text/html",
-        )
-
-    content_type = (
-        r.headers.get(
-            "Content-Type",
-            "text/html",
-        )
-    )
-
-    if "html" in content_type.lower():
-
-        text = r.content.decode(
-            r.encoding or "utf-8",
-            errors="replace",
-        )
-
-        text = rewrite_html(
-            text,
-            r.url,
-        )
-
-        return Response(
-            text,
-            status=r.status_code,
-            content_type=(
-                "text/html; charset=utf-8"
-            ),
-        )
-
-    return Response(
-        r.content,
-        status=r.status_code,
-        content_type=content_type,
+    return redirect(
+        proxy_url(target)
     )
 
 
@@ -1215,7 +1737,6 @@ def proxy_form():
 # ============================================================
 
 if __name__ == "__main__":
-
     port = int(
         os.environ.get(
             "PORT",

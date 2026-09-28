@@ -9,25 +9,25 @@ echo "Waiting for Tor on 127.0.0.1:9050..."
 until python - <<'PY'
 import socket
 
-sock = socket.socket()
-sock.settimeout(1)
+s = socket.socket()
+s.settimeout(1)
 
 try:
-    sock.connect(("127.0.0.1", 9050))
+    s.connect(("127.0.0.1", 9050))
 except Exception:
     raise SystemExit(1)
 finally:
-    sock.close()
+    s.close()
 PY
 do
     sleep 1
 done
 
-echo "Tor is running."
+echo "Tor SOCKS proxy is running."
 
 exec gunicorn \
     --bind "0.0.0.0:${PORT:-10000}" \
     --workers 1 \
-    --threads 4 \
-    --timeout 60 \
+    --threads 8 \
+    --timeout 120 \
     app:app
