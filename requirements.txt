@@ -1,0 +1,4 @@
+Flask
+requests[socks]
+beautifulsoup4
+gunicorn
